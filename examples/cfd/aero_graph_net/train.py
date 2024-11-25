@@ -36,7 +36,10 @@ from modulus.launch.utils import load_checkpoint, save_checkpoint
 
 from loggers import CompositeLogger, ExperimentLogger, init_python_logging
 from utils import batch_as_dict
-
+from datetime import datetime, timedelta
+from torch.autograd.profiler import record_function
+from functools import partial
+import socket
 
 logger = logging.getLogger("agnet")
 
@@ -198,6 +201,20 @@ class MGNTrainer:
 
         logger.info(f"Validation loss: {', '.join(loss_str)}")
 
+def trace_handler(rank, prof: torch.profiler.profile):
+    # Prefix for file names.
+    TIME_FORMAT_STR: str = "%b_%d_%H_%M_%S"
+    hostname = socket.gethostname()
+    timestamp = datetime.now().strftime(TIME_FORMAT_STR)
+    file_prefix = f"{hostname}_{timestamp}_{rank}"
+
+    # Construct the trace file.
+    prof.export_chrome_trace(f"{file_prefix}.json.gz")
+
+    device = torch.cuda.current_device()
+    # Construct the memory timeline file.
+    prof.export_memory_timeline(f"{file_prefix}.html", device=device)
+
 
 @hydra.main(version_base="1.3", config_path="conf", config_name="config")
 def main(cfg: DictConfig) -> None:
@@ -222,12 +239,26 @@ def main(cfg: DictConfig) -> None:
 
     for epoch in range(trainer.epoch_init + 1, cfg.train.epochs + 1):
         losses_agg = defaultdict(float)
-        for batch in trainer.dataloader:
-            batch = batch_as_dict(batch, dist.device)
-            losses = trainer.train(batch)
-            for k, v in losses.items():
-                losses_agg[k] += v.detach().cpu().numpy()
-        num_batches = len(trainer.dataloader)
+        trace_handler_rank = partial(trace_handler, dist.rank)
+        with torch.profiler.profile(
+           activities=[
+           torch.profiler.ProfilerActivity.CPU,
+           torch.profiler.ProfilerActivity.CUDA,
+           ],
+           schedule=torch.profiler.schedule(wait=0, warmup=0, active=5, repeat=1),
+           record_shapes=True,
+           profile_memory=True,
+           with_stack=True,
+           on_trace_ready=trace_handler_rank,
+           ) as prof:
+            for batch in trainer.dataloader:
+                batch = batch_as_dict(batch, dist.device)
+                losses = trainer.train(batch)
+                for k, v in losses.items():
+                    losses_agg[k] += v.detach().cpu().numpy()
+            num_batches = len(trainer.dataloader)
+
+
         for k, v in losses_agg.items():
             losses_agg[k] /= num_batches
 
@@ -241,10 +272,6 @@ def main(cfg: DictConfig) -> None:
             elogger.log_scalar(f"train/loss/{k}", v, epoch)
         elogger.log_scalar("lr", cur_lr, epoch)
 
-        # validation
-        # TODO(akamenev): redundant restriction, val should run on all ranks.
-        if dist.rank == 0:
-            trainer.validation(epoch)
 
         # save checkpoint
         if dist.world_size > 1:
