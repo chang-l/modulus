@@ -23,8 +23,7 @@ hydra:
 
 # ┌───────────────────────────────────────────┐
 # │            Data Preprocessing             │
-# └───────────────────────────────────────────┘  
-
+# └───────────────────────────────────────────┘
 num_nodes: [100000, 200000, 400000]                  # Number of nodes in the graphs
 node_degree: 6                                       # Degree of the nodes in the graphs
 num_partitions: 3                                    # Number of partitions for each graph
@@ -49,10 +48,16 @@ validation_partitions_path: validation_partitions   # Path to the validation par
 stats_file: global_stats.json                       # Path to the global statistics (.json file)
 checkpoint_filename: model_checkpoint.pth           # Filename of the model checkpoint
 num_epochs: 2000                                    # Number of epochs
-start_lr: 0.001                                     # Initial learning rate (cos annealing schedule is used) 
-end_lr: 0.000001                                    # Final learning rate (cos annealing schedule is used)                              
+start_lr: 0.001                                     # Initial learning rate (cos annealing schedule is used)
+end_lr: 0.000001                                    # Final learning rate (cos annealing schedule is used)
 save_checkpoint_freq: 5                             # Frequency of saving the model checkpoint
 validation_freq: 50                                 # Frequency of validation
+
+dist_mgn:
+    enabled: false
+    proc_group_name: graph_partition
+    partition_type: nodewise  # can be nodewise or coordinate_bbox.
+    metis_reorder_part: 0
 
 # ┌───────────────────────────────────────────┐
 # │        Performance Optimization           │
@@ -60,4 +65,5 @@ validation_freq: 50                                 # Frequency of validation
 
 use_concat_trick: true                              # Use the concatenation trick
 checkpoint_segments: 3                              # Number of segments for the activation checkpointing
+checkpoint_offloading: false                        # Enable checkpoint offloading
 enable_cudnn_benchmark: true                        # Enable cudnn benchmark

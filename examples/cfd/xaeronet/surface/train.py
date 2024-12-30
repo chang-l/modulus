@@ -43,9 +43,10 @@ from torch.cuda.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
 from omegaconf import DictConfig
 
-from modulus.distributed import DistributedManager
+from modulus.distributed import DistributedManager, mark_module_as_shared
 from modulus.launch.logging import initialize_wandb
 from modulus.models.meshgraphnet import MeshGraphNet
+import time
 
 # Get the absolute path to the parent directory
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -59,6 +60,11 @@ from utils import (
     count_trainable_params,
 )
 
+from modulus.models.gnn_layers import (
+    CuGraphCSC,
+    partition_graph_nodewise,
+)
+
 
 @hydra.main(version_base="1.3", config_path="conf", config_name="config")
 def main(cfg: DictConfig) -> None:
@@ -67,8 +73,15 @@ def main(cfg: DictConfig) -> None:
     torch.backends.cudnn.benchmark = cfg.enable_cudnn_benchmark
 
     # Instantiate the distributed manager
+    torch.set_num_threads(1) ## Very import to limit the number of threads to 1 for performance (especially for dist-mgn)
     DistributedManager.initialize()
     dist = DistributedManager()
+    if cfg.dist_mgn.enabled:
+        DistributedManager.create_process_subgroup(
+            name=cfg.dist_mgn.proc_group_name,
+            size=dist.world_size,
+        )
+
     device = dist.device
     print(f"Rank {dist.rank} of {dist.world_size}")
 
@@ -105,11 +118,32 @@ def main(cfg: DictConfig) -> None:
         std,
         batch_size=1,
         prefetch_factor=None,
-        use_ddp=True,
+        #use_ddp=True,
+        #use_ddp=dist.world_size > 1 and not cfg.dist_mgn.enabled,
+        use_ddp=False, #dist.world_size > 1 and not cfg.dist_mgn.enabled,
         num_workers=4,
     )
     # graphs is a list of graphs, each graph is a list of partitions
     graphs = [graph_partitions for graph_partitions, _ in train_dataloader]
+    if cfg.dist_mgn.enabled and cfg.dist_mgn.metis_reorder_part > 0:
+        if dist.rank == 0:
+            npart = cfg.dist_mgn.metis_reorder_part
+            for i in range(len(graphs)):
+                file_path = os.path.join(cfg.partitions_path, "one_partitions_reorder_{i}.bin")
+                subgraphs = graphs[i]
+                assert len(subgraphs) == 1
+                graph = subgraphs[0]
+                graph = dgl.reorder_graph(graph, node_permute_algo='metis', permute_config={'k': npart})
+                print("Reordered the graph", graph.ndata['_ID'])
+                dgl.save_graphs(file_path, [graph])
+        torch.distributed.barrier()
+        num_graphs = len(graphs)
+        graphs = []
+        for i in range(num_graphs):
+            file_path = os.path.join(cfg.partitions_path, "one_partitions_reorder_{i}.bin")
+            subgraphs, _ = dgl.load_graphs(file_path)
+            assert len(subgraphs) == 1
+            graphs.append(subgraphs)
 
     if dist.rank == 0:
         validation_dataloader = create_dataloader(
@@ -145,11 +179,13 @@ def main(cfg: DictConfig) -> None:
         mlp_activation_fn=cfg.activation,
         do_concat_trick=cfg.use_concat_trick,
         num_processor_checkpoint_segments=cfg.checkpoint_segments,
+        checkpoint_offloading=cfg.checkpoint_offloading,
     ).to(device)
     print(f"Number of trainable parameters: {count_trainable_params(model)}")
 
     # DistributedDataParallel wrapper
-    if dist.world_size > 1:
+    #if dist.world_size > 1 and not cfg.dist_mgn.enabled:
+    if not cfg.dist_mgn.enabled: # always DDP model if xaeronet
         model = DistributedDataParallel(
             model,
             device_ids=[dist.local_rank],
@@ -157,8 +193,10 @@ def main(cfg: DictConfig) -> None:
             broadcast_buffers=dist.broadcast_buffers,
             find_unused_parameters=dist.find_unused_parameters,
             gradient_as_bucket_view=True,
-            static_graph=True,
+            #static_graph=True, # disable as it does not work with ddp.no_sync()
         )
+    if cfg.dist_mgn.enabled and dist.world_size > 1:
+        mark_module_as_shared(model, cfg.dist_mgn.proc_group_name)
 
     # Optimizer and scheduler
     optimizer = optim.Adam(model.parameters(), lr=0.001)
@@ -168,20 +206,118 @@ def main(cfg: DictConfig) -> None:
     scaler = GradScaler()
     print("Instantiated the model and optimizer")
 
-    # Check if there's a checkpoint to resume from
-    start_epoch, _ = load_checkpoint(
-        model, optimizer, scaler, scheduler, cfg.checkpoint_filename
-    )
+    # Disable checkpoint for perf benchmarking
+    #start_epoch, _ = load_checkpoint(
+    #    model, optimizer, scaler, scheduler, cfg.checkpoint_filename
+    #)
+    start_epoch = 0
 
     # Training loop
     print("Training started")
+    total_time = []
     for epoch in range(start_epoch, cfg.num_epochs):
         model.train()
         total_loss = 0
         for i in range(len(graphs)):
             optimizer.zero_grad()
             subgraphs = graphs[i]  # Get the partitions of the graph
-            for j in range(cfg.num_partitions):
+            if cfg.num_partitions == 1 and cfg.dist_mgn.enabled:
+                graph = subgraphs[0]
+                offsets, indices, edge_perm = graph.adj_tensors("csc")
+                graph_partition = partition_graph_nodewise(
+                    offsets.to(dtype=torch.int64),
+                    indices.to(dtype=torch.int64),
+                    dist.world_size,
+                    dist.rank,
+                    dist.device,
+                    matrix_decomp=True,
+                )
+                graph_multi_gpu = CuGraphCSC(
+                    offsets.to(dist.device),
+                    indices.to(dist.device),
+                    graph.num_src_nodes(),
+                    graph.num_dst_nodes(),
+                    partition_size=dist.world_size,
+                    partition_group_name=cfg.dist_mgn.proc_group_name,
+                    graph_partition=graph_partition,
+                )
+                torch.cuda.synchronize()
+                torch.distributed.barrier()
+                start_timer = time.time()
+                with torch.autocast(amp_device, enabled=True, dtype=amp_dtype):
+                    part = graph
+                    ndata = torch.cat(
+                        (
+                            part.ndata["coordinates"],
+                            part.ndata["normals"],
+                            torch.sin(2 * np.pi * part.ndata["coordinates"]),
+                            torch.cos(2 * np.pi * part.ndata["coordinates"]),
+                            torch.sin(4 * np.pi * part.ndata["coordinates"]),
+                            torch.cos(4 * np.pi * part.ndata["coordinates"]),
+                            torch.sin(8 * np.pi * part.ndata["coordinates"]),
+                            torch.cos(8 * np.pi * part.ndata["coordinates"]),
+                        ),
+                        dim=1,
+                    )
+                    node_feats = graph_multi_gpu.get_dst_node_features_in_partition(
+                        ndata.to(device)
+                    )
+                    edata = graph.edata["x"][edge_perm]
+                    edge_feats = graph_multi_gpu.get_edge_features_in_partition(
+                        edata.to(device)
+                    )
+                    y = torch.cat(
+                        (part.ndata["pressure"], part.ndata["shear_stress"]), dim=1
+                    )
+                    target = graph_multi_gpu.get_dst_node_features_in_partition(
+                        y.to(device)
+                    )
+                    pred = model(node_feats, edge_feats, graph_multi_gpu)
+                    loss = (
+                        torch.mean((pred - target) ** 2)
+                        / dist.world_size
+                    )
+                    total_loss += loss.item()
+                scaler.scale(loss).backward()
+            else:
+                assert cfg.num_partitions == len(subgraphs)
+                assert cfg.num_partitions % dist.world_size == 0 # num_partitions should be divisible by world_size for this experiment
+                micro_batch_size = cfg.num_partitions // dist.world_size
+                torch.cuda.synchronize()
+                torch.distributed.barrier()
+                start_timer = time.time()
+                # iterate over micro-batches except the last one
+                for j in range(micro_batch_size * dist.rank, micro_batch_size * (dist.rank + 1) - 1):
+                    with model.no_sync():
+                        with torch.autocast(amp_device, enabled=True, dtype=amp_dtype):
+                            part = subgraphs[j].to(device)
+                            ndata = torch.cat(
+                                (
+                                    part.ndata["coordinates"],
+                                    part.ndata["normals"],
+                                    torch.sin(2 * np.pi * part.ndata["coordinates"]),
+                                    torch.cos(2 * np.pi * part.ndata["coordinates"]),
+                                    torch.sin(4 * np.pi * part.ndata["coordinates"]),
+                                    torch.cos(4 * np.pi * part.ndata["coordinates"]),
+                                    torch.sin(8 * np.pi * part.ndata["coordinates"]),
+                                    torch.cos(8 * np.pi * part.ndata["coordinates"]),
+                                ),
+                                dim=1,
+                            )
+                            pred = model(ndata, part.edata["x"], part)
+                            pred_filtered = pred[part.ndata["inner_node"].bool(), :]
+                            target = torch.cat(
+                                (part.ndata["pressure"], part.ndata["shear_stress"]), dim=1
+                            )
+                            target_filtered = target[part.ndata["inner_node"].bool()]
+                            loss = (
+                                torch.mean((pred_filtered - target_filtered) ** 2)
+                                / cfg.num_partitions
+                            )
+                            total_loss += loss.item()
+                        scaler.scale(loss).backward()
+                # last micro-batch
+                j = micro_batch_size * (dist.rank + 1) - 1
                 with torch.autocast(amp_device, enabled=True, dtype=amp_dtype):
                     part = subgraphs[j].to(device)
                     ndata = torch.cat(
@@ -208,20 +344,29 @@ def main(cfg: DictConfig) -> None:
                         / cfg.num_partitions
                     )
                     total_loss += loss.item()
-                scaler.scale(loss).backward()
+                scaler.scale(loss).backward() # last micro-batch sync gradient
+
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 32.0)
             scaler.step(optimizer)
             scaler.update()
+
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            end_timer = time.time()
+            total_time.append(end_timer - start_timer)
+
         scheduler.step()
 
         # Log the training loss
+        total_loss = torch.tensor(total_loss).cuda()
+        torch.distributed.reduce(total_loss, 0)
         if dist.rank == 0:
             current_lr = optimizer.param_groups[0]["lr"]
             print(
-                f"Epoch {epoch+1}, Learning Rate: {current_lr}, Total Loss: {total_loss / len(graphs)}"
+                f"Epoch {epoch+1}, Learning Rate: {current_lr}, Total Loss: {total_loss.item() / len(graphs)}"
             )
-            writer.add_scalar("training_loss", total_loss / len(graphs), epoch)
+            writer.add_scalar("training_loss", total_loss.item() / len(graphs), epoch)
             writer.add_scalar("learning_rate", current_lr, epoch)
 
         # Save checkpoint periodically
@@ -238,12 +383,12 @@ def main(cfg: DictConfig) -> None:
                     loss.item(),
                     cfg.checkpoint_filename,
                 )
-
         ######################################
         # Validation #
         ######################################
 
-        if dist.rank == 0 and epoch % cfg.validation_freq == 0:
+        # turn off validation for perf benchmarking
+        if dist.rank == 0 and epoch % cfg.validation_freq == 0 and False:
             valid_loss = 0
 
             for i in range(len(validation_graphs)):
@@ -397,7 +542,10 @@ def main(cfg: DictConfig) -> None:
             loss.item(),
             "final_model_checkpoint.pth",
         )
+        print(f"Average time per batch (exclude first batch): {np.mean(total_time[1:])}")
+
         print("Training complete")
+
 
 
 if __name__ == "__main__":
